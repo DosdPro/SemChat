@@ -4,20 +4,51 @@ import uuid
 import random
 import time
 import datetime
+import ast
+import operator
 from flask import Flask, request, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit, join_room
+from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ================== ФАЙЛЫ ДАННЫХ ==================
-USERS_FILE = 'users.json'
-MESSAGES_FILE = 'messages.json'
-CHANNELS_FILE = 'channels.json'
-PROMOS_FILE = 'promos.json'
-POSTS_FILE = 'posts.json'
-TOURNEY_FILE = 'tourney.json'
-GROUPS_FILE = 'groups.json'
+# ================== БАЗА ДАННЫХ (PostgreSQL / Supabase) ==================
+# Всё состояние приложения хранится в таблице state (key -> JSON).
+# Это сохраняет исходную логику работы с DB как с большим словарём,
+# но данные переживают рестарты и деплои.
+
+DATABASE_URL = os.environ.get('DATABASE_URL')
+USE_DB = bool(DATABASE_URL)
+
+if USE_DB:
+    from sqlalchemy.dialects.postgresql import JSONB as StateJSON
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    SessionLocal = sessionmaker(bind=engine)
+    Base = declarative_base()
+
+    class State(Base):
+        __tablename__ = 'state'
+        key = Column(String(64), primary_key=True)
+        value = StateJSON
+
+    Base.metadata.create_all(engine)
+
+DB_KEYS = ['users', 'messages', 'channels', 'promos_used', 'posts',
+           'tourney', 'groups', 'bot_memory']
+
+FILES = {
+    'users': 'users.json',
+    'messages': 'messages.json',
+    'channels': 'channels.json',
+    'promos_used': 'promos.json',
+    'posts': 'posts.json',
+    'tourney': 'tourney.json',
+    'groups': 'groups.json',
+    'bot_memory': 'bot_memory.json',
+}
 
 DB = {
     'users': {},
@@ -27,6 +58,7 @@ DB = {
     'posts': {},
     'tourney': {'scores': {}},
     'groups': {},
+    'bot_memory': {},
 }
 
 # ================== НАСТРОЙКИ ==================
@@ -61,26 +93,77 @@ BOT_SMALLTALK = [
     'Ха, люблю такие истории. Что дальше было?',
     'Согласен! Иногда лучше просто сыграть партию 🎮',
 ]
+BOT_JOKES = [
+    'Программист ложится спать и ставит рядом два стакана: полный — если захочет пить, пустой — если не захочет 😄',
+    'Почему программисты путают Хэллоуин и Рождество? Потому что 31 OCT = 25 DEC!',
+    'Заходит бот в бар. Бармен: «Что будете?» Бот: «Секундочку, у меня таймаут».',
+    'Оптимист видит стакан наполовину полным, пессимист — наполовину пустым, а программист — в два раза больше, чем нужно.',
+]
+BOT_FORGET = [
+    'Хм, не совсем понял 🤔 Перефразируешь?',
+    'Загадочно! Расскажешь ещё?',
+    'Записал в свою нейросетевую память. Что дальше?',
+]
+
+MATH_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+}
+
+
+def safe_math(expr):
+    """Считает арифметику без опасного eval."""
+    def _eval(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in MATH_OPS:
+            return MATH_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in MATH_OPS:
+            return MATH_OPS[type(node.op)](_eval(node.operand))
+        raise ValueError
+
+    try:
+        return round(_eval(ast.parse(expr, mode='eval').body), 4)
+    except Exception:
+        return None
 
 
 # ================== ЗАГРУЗКА / СОХРАНЕНИЕ ==================
-def load_db():
-    for fname, key in [(USERS_FILE, 'users'), (MESSAGES_FILE, 'messages'),
-                       (CHANNELS_FILE, 'channels'), (PROMOS_FILE, 'promos_used'),
-                       (POSTS_FILE, 'posts'), (TOURNEY_FILE, 'tourney'),
-                       (GROUPS_FILE, 'groups')]:
+def load_from_files():
+    """Разовая миграция со старых json-файлов (если они есть)."""
+    for key, fname in FILES.items():
         if os.path.exists(fname):
             try:
                 with open(fname, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                if isinstance(data, dict):
+                if isinstance(data, dict) and not DB[key]:
                     DB[key] = data
             except Exception as e:
                 print(f'Ошибка чтения {fname}: {e}')
+
+
+def load_db():
+    if USE_DB:
+        with SessionLocal() as db:
+            for key in DB_KEYS:
+                row = db.get(State, key)
+                if row and isinstance(row.value, dict):
+                    DB[key] = row.value
+        # если база пустая — пробуем подтянуть данные из старых json-файлов
+        if not DB['users']:
+            load_from_files()
+            save_db()
+    else:
+        load_from_files()
     DB['tourney'].setdefault('scores', {})
     migrate_channels()
     migrate_groups()
     ensure_accounts()
+    save_db()
 
 
 def migrate_channels():
@@ -105,22 +188,23 @@ def ensure_accounts():
     """Бот и владелец существуют всегда. Бот есть в контактах у всех."""
     if BOT_NAME not in DB['users']:
         DB['users'][BOT_NAME] = {
-            'password': uuid.uuid4().hex,
-            'bio': 'SemBot 🎮 Напиши мне что-нибудь или сыграй в «3 в ряд»!',
+            'password': generate_password_hash(uuid.uuid4().hex),
+            'bio': 'SemBot 🎮 Спроси время, дай мне пример, попроси шутку или сыграй в «3 в ряд»!',
             'avatar': '', 'stars': 0, 'premium': False,
             'contacts': [], 'blocked': [],
         }
-    if OWNER_NAME not in DB['users'] or DB['users'][OWNER_NAME].get('password') != OWNER_PASSWORD:
+    if OWNER_NAME not in DB['users'] or not check_password_hash(DB['users'][OWNER_NAME].get('password', ''), OWNER_PASSWORD):
         DB['users'][OWNER_NAME] = {
-            'password': OWNER_PASSWORD,
+            'password': generate_password_hash(OWNER_PASSWORD),
             'bio': 'Владелец SemChat',
             'avatar': '', 'stars': 100000, 'premium': True,
             'contacts': [], 'blocked': [],
         }
-    # Бот в контактах у всех существующих пользователей
+    # миграция старых паролей (открытый текст -> хэш)
     for name, u in DB['users'].items():
-        if name == BOT_NAME:
-            continue
+        pwd = str(u.get('password', ''))
+        if pwd and not pwd.startswith(('pbkdf2:', 'scrypt:')):
+            u['password'] = generate_password_hash(pwd)
         contacts = u.setdefault('contacts', [])
         if BOT_NAME not in contacts:
             contacts.append(BOT_NAME)
@@ -128,15 +212,22 @@ def ensure_accounts():
 
 
 def save_db():
-    for fname, key in [(USERS_FILE, 'users'), (MESSAGES_FILE, 'messages'),
-                       (CHANNELS_FILE, 'channels'), (PROMOS_FILE, 'promos_used'),
-                       (POSTS_FILE, 'posts'), (TOURNEY_FILE, 'tourney'),
-                       (GROUPS_FILE, 'groups')]:
-        try:
-            with open(fname, 'w', encoding='utf-8') as f:
-                json.dump(DB[key], f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f'Ошибка записи {fname}: {e}')
+    if USE_DB:
+        with SessionLocal() as db:
+            for key in DB_KEYS:
+                row = db.get(State, key)
+                if row is not None:
+                    row.value = DB[key]
+                else:
+                    db.add(State(key=key, value=DB[key]))
+            db.commit()
+    else:
+        for key, fname in FILES.items():
+            try:
+                with open(fname, 'w', encoding='utf-8') as f:
+                    json.dump(DB[key], f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f'Ошибка записи {fname}: {e}')
 
 
 def now_str():
@@ -194,28 +285,84 @@ def add_bot_message(to, text):
     socketio.emit('new_message', {'from': BOT_NAME, 'to': to}, room=to)
 
 
-def bot_reply_text(text):
+def bot_reply_text(text, sender=''):
     t = (text or '').strip().lower()
+
     if not t:
         return 'Круто, но я лучше понимаю текст 🙂'
-    if any(k in t for k in ['привет', 'хай', 'здравств', 'hello', 'hi', 'хеллоу']):
-        return random.choice(BOT_GREETINGS)
+
+    # Бот запоминает имя пользователя
+    m = None
+    for pat in (r'меня зовут\s+([а-яёa-z\-]{2,20})', r'моё имя\s+([а-яёa-z\-]{2,20})', r'я\s+([а-яёa-z\-]{2,20})\b'):
+        m = m or __import__('re').search(pat, t)
+    if m and ('зовут' in t or 'имя' in t):
+        name = m.group(1).capitalize()
+        DB['bot_memory'][sender] = name
+        save_db()
+        return f'Приятно познакомиться, {name}! Запомнил, больше не забуду 🙂'
+
+    # Математика: если в сообщении есть выражение с числами и знаками
+    m = __import__('re').search(r'[-+*/().\d\s]{3,}', t)
+    if m and __import__('re').search(r'\d\s*[-+*/]', m.group()):
+        result = safe_math(m.group().strip())
+        if result is not None:
+            return f'Считаю: {result} 🧮'
+
+    user_name = DB['bot_memory'].get(sender)
+
+    if any(k in t for k in ['привет', 'хай', 'здравств', 'hello', 'hi', 'хеллоу', 'добрый день', 'добрый вечер']):
+        g = random.choice(BOT_GREETINGS)
+        if user_name:
+            g = f'{user_name}, ' + g[0].lower() + g[1:]
+        return g
+
     if any(k in t for k in ['как дела', 'как ты', 'чё как', 'что делаешь', 'чем занят']):
         return random.choice([
             'Отлично! Кручу логику и жду соперника в «3 в ряд» 🎮',
-            'Всё чётко! Сам как?',
+            'Всё чётко, база данных на месте, память мне больше не стирают 😎',
+            'Работаю без сбоев! А у тебя как?',
         ])
+
+    if 'время' in t:
+        return f'Сейчас {datetime.datetime.now().strftime("%H:%M")} по серверному времени ⏰'
+
+    if 'дата' in t or 'какое число' in t or 'какой сегодня день' in t:
+        days = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']
+        now = datetime.datetime.now()
+        return f'Сегодня {now.strftime("%d.%m.%Y")}, {days[now.weekday()]} 📅'
+
+    if 'кубик' in t or 'рандомное число' in t or 'случайное число' in t:
+        return f'Кидаю кубик... выпало {random.randint(1, 6)}! 🎲'
+
+    if 'монет' in t or 'орёл' in t or 'решк' in t:
+        return f'Подбрасываю монетку... {random.choice(["Орёл!", "Решка!"])} 🪙'
+
+    if 'анекдот' in t or 'шутк' in t or 'шути' in t or 'смешн' in t:
+        return random.choice(BOT_JOKES)
+
+    if 'кто ты' in t or 'ты кто' in t or 'ты бот' in t or 'ты робот' in t:
+        return 'Я SemBot 🤖 Живу в этом чате: болтаю, считаю примеры, знаю время и дату, кидаю кубик и играю с тобой в «3 в ряд»!'
+
     if any(k in t for k in ['игра', '3 в ряд', 'три в ряд', 'кристал', 'сыгра', 'сыграть', 'турнир']):
         return 'Жми на 💎 вверху чата и вперёд! Меняй кристаллы местами, собирай 3+ в линию. Топ-3 турнира получают звёзды: 🥇 100 · 🥈 50 · 🥉 10. У тебя 90 секунд на партию!'
+
     if any(k in t for k in ['звёзд', 'звезд', 'stars', 'star']):
-        return 'Звёзды за турнир выдаёт владелец SemChat. Играй в «3 в ряд», набирай очки и попадай в топ-3!'
+        return 'Звёзды за турнир выдаёт владелец SemChat. Играй в «3 в ряд», набирай очки и попадай в топ-3! ⭐'
+
+    if 'спасибо' in t or 'благодар' in t:
+        return random.choice(['Всегда пожалуйста! 😊', 'Обращайся!', f'Не за что{", " + user_name if user_name else ""}!'])
+
+    if 'пока' in t or 'до встречи' in t or 'бай' in t or 'прощай' in t:
+        return random.choice([f'Пока-пока{", " + user_name if user_name else ""}! 👋', 'До связи! Заходи играть 🎮'])
+
     if any(k in t for k in ['помощь', 'help', 'что умеешь', 'команды']):
-        return 'Я умею: болтать 🗨 и играть с тобой в «3 в ряд» 🎮 (кнопка 💎 вверху чата). Призы турнира: 🥇 100 · 🥈 50 · 🥉 10 ⭐.'
-    if any(k in t for k in ['спасибо', 'благодар']):
-        return random.choice(['Всегда пожалуйста! 😊', 'Обращайся!'])
-    if any(k in t for k in ['пока', 'до встречи', 'бай', 'прощай']):
-        return random.choice(['Пока-пока! 👋', 'До связи! Заходи играть 🎮'])
-    return random.choice(BOT_SMALLTALK)
+        return ('Я умею: болтать 🗨, считать примеры (напиши «2+2*3»), говорить время и дату, '
+                'кидать кубик и монетку 🎲🪙, рассказывать шутки 😄, запоминать твоё имя («меня зовут …») '
+                'и играть с тобой в «3 в ряд» 🎮 (кнопка 💎 вверху чата). Призы турнира: 🥇 100 · 🥈 50 · 🥉 10 ⭐.')
+
+    if user_name:
+        return f'{user_name}, ' + random.choice(BOT_FORGET)
+    return random.choice(BOT_FORGET)
 
 
 # ================== ОНЛАЙН-СТАТУС ==================
@@ -258,7 +405,7 @@ def register():
     if username in DB['users']:
         return jsonify({'ok': False, 'error': 'Пользователь уже существует'})
     DB['users'][username] = {
-        'password': password,
+        'password': generate_password_hash(password),
         'bio': '', 'avatar': '', 'stars': 0, 'premium': False,
         'contacts': [BOT_NAME],          # бот в контактах сразу, как в Telegram
         'blocked': [],
@@ -272,7 +419,19 @@ def login():
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip()
     password = (data.get('password') or '').strip()
-    if username not in DB['users'] or DB['users'][username].get('password') != password:
+    u = DB['users'].get(username)
+    ok = False
+    if u:
+        try:
+            ok = check_password_hash(u.get('password', ''), password)
+        except Exception:
+            ok = False
+        # страховка для старых аккаунтов с открытым паролем
+        if not ok and u.get('password') == password:
+            ok = True
+            u['password'] = generate_password_hash(password)
+            save_db()
+    if not ok:
         return jsonify({'ok': False, 'error': 'Неверный логин или пароль'})
     return jsonify({'ok': True})
 
@@ -302,7 +461,7 @@ def set_profile(username):
     if 'bio' in data:
         u['bio'] = str(data['bio'])[:200]
     if data.get('new_password'):
-        u['password'] = data['new_password']
+        u['password'] = generate_password_hash(data['new_password'])
     save_db()
     return jsonify({'ok': True})
 
@@ -543,7 +702,7 @@ def send_message():
     })
     # Бот отвечает всегда, как в Telegram
     if receiver == BOT_NAME and mtype == 'text':
-        add_bot_message(sender, bot_reply_text(text or ''))
+        add_bot_message(sender, bot_reply_text(text or '', sender))
     save_db()
     socketio.emit('new_message', {'from': sender, 'to': receiver}, room=receiver)
     return jsonify({'ok': True})
