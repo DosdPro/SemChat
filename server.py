@@ -16,23 +16,66 @@ app = Flask(__name__, static_folder='.', static_url_path='')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # ================== БАЗА ДАННЫХ (PostgreSQL / Supabase) ==================
-# Всё состояние приложения хранится в таблице state (key -> JSON).
-# Это сохраняет исходную логику работы с DB как с большим словарём,
-# но данные переживают рестарты и деплои.
+# Отдельные таблицы: users, chats, groups, channels, posts,
+# promos_used, tourney, bot_memory. Старая таблица state используется
+# один раз — чтобы перенести в неё данные (и остаётся как резерв).
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 USE_DB = bool(DATABASE_URL)
 
 if USE_DB:
-    from sqlalchemy.dialects.postgresql import JSONB as StateJSON
+    from sqlalchemy.dialects.postgresql import JSONB as JD
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     SessionLocal = sessionmaker(bind=engine)
     Base = declarative_base()
 
-    class State(Base):
+    class UserRow(Base):
+        __tablename__ = 'users'
+        username = Column(String(32), primary_key=True)
+        data = Column(JD)
+
+    class ChatRow(Base):
+        __tablename__ = 'chats'
+        chat_key = Column(String(64), primary_key=True)
+        data = Column(JD)  # список сообщений этого чата
+
+    class GroupRow(Base):
+        __tablename__ = 'groups'
+        gid = Column(String(32), primary_key=True)
+        data = Column(JD)
+
+    class ChannelRow(Base):
+        __tablename__ = 'channels'
+        cid = Column(String(32), primary_key=True)
+        owner = Column(String(32))
+        data = Column(JD)
+
+    class PostRow(Base):
+        __tablename__ = 'posts'
+        pid = Column(String(32), primary_key=True)
+        channel_id = Column(String(32))
+        data = Column(JD)
+
+    class PromoRow(Base):
+        __tablename__ = 'promos_used'
+        username = Column(String(32), primary_key=True)
+        codes = Column(JD)
+
+    class TourneyRow(Base):
+        __tablename__ = 'tourney'
+        username = Column(String(32), primary_key=True)
+        score = Column(Integer)
+
+    class BotMemRow(Base):
+        __tablename__ = 'bot_memory'
+        username = Column(String(32), primary_key=True)
+        name = Column(String(64))
+
+    # старая таблица — только для переноса данных
+    class LegacyState(Base):
         __tablename__ = 'state'
         key = Column(String(64), primary_key=True)
-        value = StateJSON
+        value = Column(JD)
 
     Base.metadata.create_all(engine)
 
@@ -60,6 +103,14 @@ DB = {
     'groups': {},
     'bot_memory': {},
 }
+
+# чаты, которые нужно перезаписать в базу при следующем сохранении
+DIRTY_CHATS = set()
+
+
+def mark_chat(key):
+    DIRTY_CHATS.add(key)
+
 
 # ================== НАСТРОЙКИ ==================
 PROMO_CODES = {'dravsem': 500}
@@ -149,14 +200,69 @@ def load_from_files():
 def load_db():
     if USE_DB:
         with SessionLocal() as db:
-            for key in DB_KEYS:
-                row = db.get(State, key)
-                if row and isinstance(row.value, dict):
-                    DB[key] = row.value
-        # если база пустая — пробуем подтянуть данные из старых json-файлов
-        if not DB['users']:
-            load_from_files()
-            save_db()
+            # старая таблица state — источник для переноса данных
+            legacy = {}
+            try:
+                for row in db.query(LegacyState).all():
+                    if isinstance(row.value, dict):
+                        legacy[row.key] = row.value
+            except Exception as e:
+                print('Старая таблица state недоступна:', e)
+
+            users_rows = {r.username: r.data for r in db.query(UserRow).all()}
+            if users_rows:
+                DB['users'] = users_rows
+            elif legacy.get('users'):
+                DB['users'] = legacy['users']
+
+            chats_rows = {r.chat_key: r.data for r in db.query(ChatRow).all()}
+            if chats_rows:
+                DB['messages'] = chats_rows
+            elif legacy.get('messages'):
+                DB['messages'] = legacy['messages']
+
+            groups_rows = {r.gid: r.data for r in db.query(GroupRow).all()}
+            if groups_rows:
+                DB['groups'] = groups_rows
+            elif legacy.get('groups'):
+                DB['groups'] = legacy['groups']
+
+            chans_rows = {}
+            for r in db.query(ChannelRow).all():
+                chans_rows.setdefault(r.owner, []).append(r.data)
+            if chans_rows:
+                DB['channels'] = chans_rows
+            elif legacy.get('channels'):
+                DB['channels'] = legacy['channels']
+
+            posts_rows = {}
+            for r in db.query(PostRow).all():
+                posts_rows.setdefault(r.channel_id, []).append(r.data)
+            if posts_rows:
+                DB['posts'] = posts_rows
+            elif legacy.get('posts'):
+                DB['posts'] = legacy['posts']
+
+            promos_rows = {r.username: r.codes for r in db.query(PromoRow).all()}
+            if promos_rows:
+                DB['promos_used'] = promos_rows
+            elif legacy.get('promos_used'):
+                DB['promos_used'] = legacy['promos_used']
+
+            tourney_rows = {r.username: r.score for r in db.query(TourneyRow).all()}
+            if tourney_rows:
+                DB['tourney'] = {'scores': tourney_rows}
+            elif legacy.get('tourney'):
+                DB['tourney'] = legacy['tourney']
+
+            mem_rows = {r.username: r.name for r in db.query(BotMemRow).all()}
+            if mem_rows:
+                DB['bot_memory'] = mem_rows
+            elif legacy.get('bot_memory'):
+                DB['bot_memory'] = legacy['bot_memory']
+
+            if not DB['users']:
+                load_from_files()
     else:
         load_from_files()
     DB['tourney'].setdefault('scores', {})
@@ -214,12 +320,67 @@ def ensure_accounts():
 def save_db():
     if USE_DB:
         with SessionLocal() as db:
-            for key in DB_KEYS:
-                row = db.get(State, key)
+            # пользователи
+            for name, u in DB['users'].items():
+                row = db.get(UserRow, name)
                 if row is not None:
-                    row.value = DB[key]
+                    row.data = u
                 else:
-                    db.add(State(key=key, value=DB[key]))
+                    db.add(UserRow(username=name, data=u))
+            # чаты: перезаписываем только изменённые
+            for key in DIRTY_CHATS:
+                data = DB['messages'].get(key, [])
+                row = db.get(ChatRow, key)
+                if row is not None:
+                    row.data = data
+                else:
+                    db.add(ChatRow(chat_key=key, data=data))
+            DIRTY_CHATS.clear()
+            # группы
+            for gid, g in DB['groups'].items():
+                row = db.get(GroupRow, gid)
+                if row is not None:
+                    row.data = g
+                else:
+                    db.add(GroupRow(gid=gid, data=g))
+            # каналы
+            for owner, chs in DB['channels'].items():
+                for ch in chs:
+                    row = db.get(ChannelRow, ch['id'])
+                    if row is not None:
+                        row.owner = owner
+                        row.data = ch
+                    else:
+                        db.add(ChannelRow(cid=ch['id'], owner=owner, data=ch))
+            # посты
+            for cid, posts in DB['posts'].items():
+                for p in posts:
+                    row = db.get(PostRow, p['id'])
+                    if row is not None:
+                        row.data = p
+                    else:
+                        db.add(PostRow(pid=p['id'], channel_id=cid, data=p))
+            # промокоды
+            for username, codes in DB['promos_used'].items():
+                row = db.get(PromoRow, username)
+                if row is not None:
+                    row.codes = codes
+                else:
+                    db.add(PromoRow(username=username, codes=codes))
+            # турнир
+            for username, score in DB['tourney'].get('scores', {}).items():
+                row = db.get(TourneyRow, username)
+                if row is not None:
+                    row.score = score
+                else:
+                    db.add(TourneyRow(username=username, score=score))
+            # память бота
+            for username, name in DB['bot_memory'].items():
+                row = db.get(BotMemRow, username)
+                if row is not None:
+                    row.name = name
+                else:
+                    db.add(BotMemRow(username=username, name=name))
             db.commit()
     else:
         for key, fname in FILES.items():
@@ -228,6 +389,14 @@ def save_db():
                     json.dump(DB[key], f, ensure_ascii=False, indent=2)
             except Exception as e:
                 print(f'Ошибка записи {fname}: {e}')
+
+
+def delete_rows(model, field, value):
+    """Удаляет строки из таблицы (для удаления каналов/групп)."""
+    if USE_DB:
+        with SessionLocal() as db:
+            db.query(model).filter(field == value).delete()
+            db.commit()
 
 
 def now_str():
@@ -242,12 +411,18 @@ def get_chat(a, b):
     return DB['messages'].setdefault(chat_key(a, b), [])
 
 
+def add_message(a, b, msg):
+    """Добавляет сообщение в чат и помечает чат для сохранения."""
+    get_chat(a, b).append(msg)
+    mark_chat(chat_key(a, b))
+
+
 def find_message(msg_id):
-    for msgs in DB['messages'].values():
+    for key, msgs in DB['messages'].items():
         for m in msgs:
             if m.get('id') == msg_id:
-                return m
-    return None
+                return key, m
+    return None, None
 
 
 def find_channel(cid):
@@ -274,7 +449,7 @@ def add_bot_message(to, text):
     """Сообщение от бота в личный чат с пользователем."""
     if to not in DB['users'] or to == BOT_NAME:
         return
-    get_chat(BOT_NAME, to).append({
+    add_message(BOT_NAME, to, {
         'sender': BOT_NAME,
         'text': text,
         'type': 'text',
@@ -661,6 +836,7 @@ def group_delete(gid):
     if data.get('username') != g['owner']:
         return jsonify({'ok': False, 'error': 'Удалять может только создатель'})
     DB['groups'].pop(gid, None)
+    delete_rows(GroupRow, GroupRow.gid, gid)
     save_db()
     return jsonify({'ok': True})
 
@@ -692,7 +868,7 @@ def send_message():
             return jsonify({'ok': False, 'error': err})
     elif mtype in ('text', 'gift') and not (text or '').strip():
         return jsonify({'ok': False, 'error': 'Пустое сообщение'})
-    get_chat(sender, receiver).append({
+    add_message(sender, receiver, {
         'sender': sender,
         'text': text,
         'type': mtype,
@@ -723,7 +899,9 @@ def bot_start(me):
 
 @app.route('/delete_chat/<me>/<other>', methods=['POST'])
 def delete_chat(me, other):
-    DB['messages'][chat_key(me, other)] = []
+    key = chat_key(me, other)
+    DB['messages'][key] = []
+    mark_chat(key)
     save_db()
     return jsonify({'ok': True})
 
@@ -739,7 +917,7 @@ def react():
         return jsonify({'ok': False, 'error': 'Нет пользователя'})
     if emoji not in REACTION_EMOJI:
         return jsonify({'ok': False, 'error': 'Недопустимая реакция'})
-    target = find_message(msg_id)
+    key, target = find_message(msg_id)
     if not target:
         return jsonify({'ok': False, 'error': 'Сообщение не найдено'})
     reactions = target.setdefault('reactions', {})
@@ -750,6 +928,7 @@ def react():
             del reactions[emoji]
     else:
         users.append(username)
+    mark_chat(key)
     save_db()
     socketio.emit('msg_reactions', {'msg_id': msg_id, 'reactions': target['reactions']})
     return jsonify({'ok': True, 'reactions': target['reactions']})
@@ -815,7 +994,7 @@ def gift():
     if u.get('stars', 0) < price:
         return jsonify({'ok': False, 'error': 'Недостаточно звезд'})
     u['stars'] -= price
-    get_chat(sender, receiver).append({
+    add_message(sender, receiver, {
         'sender': sender,
         'text': json.dumps(payload, ensure_ascii=False) if payload else '{}',
         'type': 'gift',
@@ -834,7 +1013,7 @@ def gift():
 def sell_gift(me, msg_id):
     if me not in DB['users']:
         return jsonify({'ok': False, 'error': 'Нет пользователя'})
-    for msgs in DB['messages'].values():
+    for key, msgs in DB['messages'].items():
         for m in msgs:
             if m.get('id') == msg_id and m.get('type') == 'gift' and m.get('sender') != me:
                 try:
@@ -843,6 +1022,7 @@ def sell_gift(me, msg_id):
                     price = 0
                 gain = price // 2
                 msgs.remove(m)
+                mark_chat(key)
                 DB['users'][me]['stars'] = DB['users'][me].get('stars', 0) + gain
                 save_db()
                 return jsonify({'ok': True, 'stars': DB['users'][me]['stars'], 'gain': gain})
@@ -1146,7 +1326,7 @@ def channel_invite(cid):
         return jsonify({'ok': False, 'error': 'Канал не найден'})
     if is_blocked(sender, receiver):
         return jsonify({'ok': False, 'error': 'Вы заблокированы этим пользователем'})
-    get_chat(sender, receiver).append({
+    add_message(sender, receiver, {
         'sender': sender,
         'text': json.dumps({'channel_id': cid, 'title': ch.get('title', 'Канал'), 'owner': owner},
                            ensure_ascii=False),
@@ -1204,6 +1384,8 @@ def channel_delete(cid):
     mine = DB['channels'].get(owner, [])
     DB['channels'][owner] = [c for c in mine if c.get('id') != cid]
     DB['posts'].pop(cid, None)
+    delete_rows(ChannelRow, ChannelRow.cid, cid)
+    delete_rows(PostRow, PostRow.channel_id, cid)
     save_db()
     return jsonify({'ok': True})
 
